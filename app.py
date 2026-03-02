@@ -119,15 +119,43 @@ def create_or_find_company(company_name: str, company_url: str = "") -> str:
     return company_id
 
 
-def create_deal(deal_name: str, contact_id: str, company_id: str) -> str:
+def find_hubspot_owner_by_email(email: str) -> str:
+    """Look up a HubSpot owner ID by their email address."""
+    url = f"{HUBSPOT_BASE}/crm/v3/owners"
+    resp = requests.get(url, headers=hubspot_headers(), params={"limit": 100, "email": email})
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    if results:
+        owner_id = results[0]["id"]
+        logger.info(f"Found HubSpot owner {owner_id} for {email}")
+        return owner_id
+    # If exact email param doesn't work, search all owners
+    resp = requests.get(url, headers=hubspot_headers(), params={"limit": 100})
+    resp.raise_for_status()
+    for owner in resp.json().get("results", []):
+        if owner.get("email", "").lower() == email.lower():
+            logger.info(f"Found HubSpot owner {owner['id']} for {email}")
+            return owner["id"]
+    logger.warning(f"No HubSpot owner found for {email}")
+    return ""
+
+
+def create_deal(deal_name: str, contact_id: str, company_id: str, amount: str = "", close_date: str = "", owner_id: str = "") -> str:
     """Create a deal in the Sales Pipeline at Demo Booked stage, associated with contact + company."""
     url = f"{HUBSPOT_BASE}/crm/v3/objects/deals"
+    properties = {
+        "dealname": deal_name,
+        "pipeline": HUBSPOT_PIPELINE_ID,
+        "dealstage": HUBSPOT_STAGE_ID,
+    }
+    if amount:
+        properties["amount"] = amount
+    if close_date:
+        properties["closedate"] = close_date
+    if owner_id:
+        properties["hubspot_owner_id"] = owner_id
     body = {
-        "properties": {
-            "dealname": deal_name,
-            "pipeline": HUBSPOT_PIPELINE_ID,
-            "dealstage": HUBSPOT_STAGE_ID,
-        },
+        "properties": properties,
         "associations": [
             {
                 "to": {"id": contact_id},
@@ -212,6 +240,28 @@ def open_demo_form(ack, body, client):
                     },
                     "optional": True,
                 },
+                {
+                    "type": "input",
+                    "block_id": "amount_block",
+                    "label": {"type": "plain_text", "text": "Deal Amount ($)"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "amount",
+                        "placeholder": {"type": "plain_text", "text": "e.g. 50000"},
+                    },
+                    "optional": True,
+                },
+                {
+                    "type": "input",
+                    "block_id": "close_date_block",
+                    "label": {"type": "plain_text", "text": "Expected Close Date"},
+                    "element": {
+                        "type": "datepicker",
+                        "action_id": "close_date",
+                        "placeholder": {"type": "plain_text", "text": "Pick a date"},
+                    },
+                    "optional": True,
+                },
             ],
         },
     )
@@ -227,6 +277,8 @@ def handle_submission(ack, body, client, view):
     company_name = values["company_block"]["company_name"]["value"].strip()
     email = values["email_block"]["email"]["value"].strip()
     company_url = (values["company_url_block"]["company_url"]["value"] or "").strip()
+    amount = (values["amount_block"]["amount"]["value"] or "").strip()
+    close_date = (values["close_date_block"]["close_date"]["selected_date"] or "")
 
     # Parse first/last name
     name_parts = full_name.split(" ", 1)
@@ -241,33 +293,52 @@ def handle_submission(ack, body, client, view):
     ack()
 
     user_id = body["user"]["id"]
-    deal_name = f"Demo - {company_name} ({full_name})"
+    deal_name = company_name
+
+    # Look up the Slack user's email to find their HubSpot owner ID
+    owner_id = ""
+    try:
+        slack_user_info = client.users_info(user=user_id)
+        slack_email = slack_user_info["user"]["profile"].get("email", "")
+        if slack_email:
+            owner_id = find_hubspot_owner_by_email(slack_email)
+    except Exception as e:
+        logger.warning(f"Could not look up Slack user email: {e}")
 
     try:
         # 1. Create or find contact
         contact_id = create_or_find_contact(email, first_name, last_name)
 
-        # 2. Create or find company
+        # 2. Set contact owner if we found one
+        if owner_id:
+            update_url = f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}"
+            requests.patch(update_url, json={"properties": {"hubspot_owner_id": owner_id}}, headers=hubspot_headers())
+            logger.info(f"Set contact {contact_id} owner to {owner_id}")
+
+        # 3. Create or find company
         company_id = create_or_find_company(company_name, company_url)
 
-        # 3. Associate contact ↔ company
+        # 4. Associate contact ↔ company
         associate_contact_to_company(contact_id, company_id)
 
-        # 4. Create deal linked to both
-        deal_id = create_deal(deal_name, contact_id, company_id)
+        # 5. Create deal linked to both
+        deal_id = create_deal(deal_name, contact_id, company_id, amount, close_date, owner_id)
 
         # Notify the user via DM
-        client.chat_postMessage(
-            channel=user_id,
-            text=(
-                f"✅ *Demo Booked* created in HubSpot!\n\n"
-                f"• *Deal:* {deal_name}\n"
-                f"• *Contact:* {full_name} ({email})\n"
-                f"• *Company:* {company_name}\n"
-                f"• *Stage:* Demo Booked (Sales Pipeline)\n\n"
-                f"<https://app.hubspot.com/contacts/46061347/record/0-3/{deal_id}|View Deal in HubSpot>"
-            ),
+        msg = (
+            f"✅ *Demo Booked* created in HubSpot!\n\n"
+            f"• *Deal:* {deal_name}\n"
+            f"• *Contact:* {full_name} ({email})\n"
+            f"• *Company:* {company_name}\n"
+            f"• *Stage:* Demo Booked (Sales Pipeline)\n"
         )
+        if amount:
+            msg += f"• *Amount:* ${amount}\n"
+        if close_date:
+            msg += f"• *Close Date:* {close_date}\n"
+        msg += f"\n<https://app.hubspot.com/contacts/46061347/record/0-3/{deal_id}|View Deal in HubSpot>"
+
+        client.chat_postMessage(channel=user_id, text=msg)
 
     except Exception as e:
         logger.error(f"HubSpot error: {e}")
