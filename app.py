@@ -216,21 +216,22 @@ def associate_contact_to_company(contact_id: str, company_id: str):
     logger.info(f"Associated contact {contact_id} with company {company_id}")
 
 
-def search_deals_by_name(query: str) -> list:
-    """Search for deals in the new pipeline by name. Returns list of {id, name, stage}."""
+def search_deals_by_name(query: str, all_pipelines: bool = False) -> list:
+    """Search for deals by name. If all_pipelines=False, only searches Sales Pipeline New."""
     url = f"{HUBSPOT_BASE}/crm/v3/objects/deals/search"
     body = {
         "query": query,
         "properties": ["dealname", "dealstage", "pipeline", "amount"],
-        "filterGroups": [{
+        "limit": 20,
+    }
+    if not all_pipelines:
+        body["filterGroups"] = [{
             "filters": [{
                 "propertyName": "pipeline",
                 "operator": "EQ",
                 "value": HUBSPOT_PIPELINE_ID,
             }]
-        }],
-        "limit": 20,
-    }
+        }]
     resp = requests.post(url, json=body, headers=hubspot_headers())
     resp.raise_for_status()
     results = resp.json().get("results", [])
@@ -1092,7 +1093,7 @@ def handle_tldr_search(ack, body, client, view):
     ack()
 
     user_id = body["user"]["id"]
-    deals = search_deals_by_name(query)
+    deals = search_deals_by_name(query, all_pipelines=True)
 
     if not deals:
         client.chat_postMessage(channel=user_id, text=f"No deals found matching *{query}*. Try `/tldr` again.")
