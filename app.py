@@ -10,14 +10,21 @@ Commands:
   /won          → Mark a deal as Closed Won
   /lost         → Mark a deal as Closed Lost (with reason)
   /tldr         → Get an AI-powered deal summary
+
+Scheduled:
+  Daily Pipeline Recap → Posts pipeline summary to a Slack channel every morning
 """
 
 import os
 import logging
+import threading
 import requests
 import anthropic
+from datetime import datetime, timedelta
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ── Config ───────────────────────────────────────────────────────────────────
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
@@ -25,6 +32,12 @@ SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]  # xapp-... token for Socket Mod
 HUBSPOT_API_KEY = os.environ["HUBSPOT_API_KEY"]  # Private app access token
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Channel where the daily pipeline recap will be posted (right-click channel → Copy link → grab the ID)
+RECAP_CHANNEL_ID = os.environ.get("RECAP_CHANNEL_ID", "")
+# Time to post the daily recap (24h format, US Eastern). Default: 9:00 AM
+RECAP_HOUR = int(os.environ.get("RECAP_HOUR", "9"))
+RECAP_MINUTE = int(os.environ.get("RECAP_MINUTE", "0"))
 
 HUBSPOT_BASE = "https://api.hubapi.com"
 HUBSPOT_ACCOUNT_ID = "46061347"
@@ -561,7 +574,7 @@ def handle_note_search(ack, body, client, view):
     ack()
 
     user_id = body["user"]["id"]
-    deals = search_deals_by_name(query)
+    deals = search_deals_by_name(query, all_pipelines=True)
 
     if not deals:
         client.chat_postMessage(
@@ -1178,9 +1191,267 @@ def handle_tldr(ack, body, client, view):
         )
 
 
+# ── Daily Pipeline Recap ─────────────────────────────────────────────────────
+
+def get_all_deals_in_pipeline():
+    """Fetch ALL deals in Sales Pipeline New with key properties."""
+    all_deals = []
+    after = None
+    url = f"{HUBSPOT_BASE}/crm/v3/objects/deals/search"
+
+    while True:
+        body = {
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "pipeline",
+                    "operator": "EQ",
+                    "value": HUBSPOT_PIPELINE_ID,
+                }]
+            }],
+            "properties": [
+                "dealname", "dealstage", "amount", "closedate",
+                "hubspot_owner_id", "createdate", "notes_last_contacted",
+                "hs_lastmodifieddate",
+            ],
+            "limit": 100,
+        }
+        if after:
+            body["after"] = after
+
+        resp = requests.post(url, json=body, headers=hubspot_headers())
+        resp.raise_for_status()
+        data = resp.json()
+        all_deals.extend(data.get("results", []))
+
+        paging = data.get("paging", {})
+        next_page = paging.get("next", {})
+        after = next_page.get("after")
+        if not after:
+            break
+
+    return all_deals
+
+
+def get_owner_name(owner_id):
+    """Get a HubSpot owner's name by their ID."""
+    if not owner_id:
+        return "Unassigned"
+    try:
+        url = f"{HUBSPOT_BASE}/crm/v3/owners/{owner_id}"
+        resp = requests.get(url, headers=hubspot_headers())
+        resp.raise_for_status()
+        data = resp.json()
+        first = data.get("firstName", "")
+        last = data.get("lastName", "")
+        return f"{first} {last}".strip() or "Unknown"
+    except Exception:
+        return "Unknown"
+
+
+def build_pipeline_recap():
+    """Build the daily pipeline recap message."""
+    stage_id_to_name = {v: k for k, v in STAGES.items()}
+    deals = get_all_deals_in_pipeline()
+
+    if not deals:
+        return "📊 *Daily Pipeline Recap*\n\nNo deals found in Sales Pipeline New."
+
+    # ── Group deals by stage ──
+    by_stage = {}
+    for deal in deals:
+        props = deal.get("properties", {})
+        stage_id = props.get("dealstage", "")
+        stage_name = stage_id_to_name.get(stage_id, "Unknown")
+        if stage_name not in by_stage:
+            by_stage[stage_name] = []
+        by_stage[stage_name].append(props)
+
+    # ── Calculate metrics ──
+    total_deals = len(deals)
+    total_value = 0
+    for deal in deals:
+        amt = deal.get("properties", {}).get("amount")
+        if amt:
+            try:
+                total_value += float(amt)
+            except (ValueError, TypeError):
+                pass
+
+    # Deals closing this week
+    today = datetime.utcnow().date()
+    end_of_week = today + timedelta(days=(6 - today.weekday()))  # Sunday
+    closing_this_week = []
+    for deal in deals:
+        props = deal.get("properties", {})
+        close_str = props.get("closedate", "")
+        if close_str:
+            try:
+                close_date = datetime.fromisoformat(close_str.replace("Z", "+00:00")).date()
+                if today <= close_date <= end_of_week:
+                    closing_this_week.append(props)
+            except (ValueError, TypeError):
+                pass
+
+    # Deals with no activity in 7+ days
+    stale_deals = []
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    for deal in deals:
+        props = deal.get("properties", {})
+        stage_id = props.get("dealstage", "")
+        stage_name = stage_id_to_name.get(stage_id, "")
+        # Skip terminal stages
+        if stage_name in ("Closed Won", "Closed Lost", "Parked"):
+            continue
+        last_mod = props.get("hs_lastmodifieddate", "")
+        if last_mod:
+            try:
+                mod_date = datetime.fromisoformat(last_mod.replace("Z", "+00:00"))
+                if mod_date.replace(tzinfo=None) < seven_days_ago:
+                    stale_deals.append(props)
+            except (ValueError, TypeError):
+                pass
+
+    # New deals (created in last 24h)
+    yesterday = datetime.utcnow() - timedelta(hours=24)
+    new_deals = []
+    for deal in deals:
+        props = deal.get("properties", {})
+        created = props.get("createdate", "")
+        if created:
+            try:
+                created_date = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if created_date.replace(tzinfo=None) >= yesterday:
+                    new_deals.append(props)
+            except (ValueError, TypeError):
+                pass
+
+    # ── Build message ──
+    msg = f"📊 *Daily Pipeline Recap — {today.strftime('%A, %B %d')}*\n\n"
+
+    # Top-line stats
+    msg += f"*{total_deals}* deals in pipeline  •  "
+    msg += f"*${total_value:,.0f}* total value  •  "
+    msg += f"*{len(closing_this_week)}* closing this week\n\n"
+
+    # Deals per stage (in pipeline order)
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "*Deals by Stage*\n"
+    for stage_name in STAGES:
+        deals_in_stage = by_stage.get(stage_name, [])
+        count = len(deals_in_stage)
+        if count == 0:
+            continue
+        stage_value = 0
+        for d in deals_in_stage:
+            amt = d.get("amount")
+            if amt:
+                try:
+                    stage_value += float(amt)
+                except (ValueError, TypeError):
+                    pass
+        bar = "█" * min(count, 15)
+        msg += f"  {stage_name}: *{count}* deal{'s' if count != 1 else ''}  (${stage_value:,.0f})  {bar}\n"
+    msg += "\n"
+
+    # Closing this week
+    if closing_this_week:
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "📅 *Closing This Week*\n"
+        for d in closing_this_week:
+            name = d.get("dealname", "Unknown")
+            amt = d.get("amount", "")
+            close = d.get("closedate", "")[:10] if d.get("closedate") else ""
+            amt_str = f" — ${float(amt):,.0f}" if amt else ""
+            msg += f"  • {name}{amt_str} (close: {close})\n"
+        msg += "\n"
+
+    # New deals (last 24h)
+    if new_deals:
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "🆕 *New Deals (Last 24h)*\n"
+        for d in new_deals:
+            name = d.get("dealname", "Unknown")
+            amt = d.get("amount", "")
+            amt_str = f" — ${float(amt):,.0f}" if amt else ""
+            msg += f"  • {name}{amt_str}\n"
+        msg += "\n"
+
+    # Stale deals (no activity in 7+ days)
+    if stale_deals:
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "⚠️ *Needs Attention (No activity in 7+ days)*\n"
+        for d in stale_deals[:10]:  # Cap at 10 to keep message readable
+            name = d.get("dealname", "Unknown")
+            stage_id = d.get("dealstage", "")
+            stage = stage_id_to_name.get(stage_id, "Unknown")
+            msg += f"  • {name} — stuck in _{stage}_\n"
+        if len(stale_deals) > 10:
+            msg += f"  _...and {len(stale_deals) - 10} more_\n"
+        msg += "\n"
+
+    msg += f"_View full pipeline: <https://app.hubspot.com/contacts/{HUBSPOT_ACCOUNT_ID}/objects/0-3/views/all/board|Open HubSpot>_"
+
+    return msg
+
+
+def post_daily_recap():
+    """Post the daily pipeline recap to the configured Slack channel."""
+    if not RECAP_CHANNEL_ID:
+        logger.warning("RECAP_CHANNEL_ID not set — skipping daily recap.")
+        return
+
+    try:
+        logger.info("Generating daily pipeline recap...")
+        message = build_pipeline_recap()
+
+        from slack_sdk import WebClient
+        client = WebClient(token=SLACK_BOT_TOKEN)
+        client.chat_postMessage(channel=RECAP_CHANNEL_ID, text=message)
+        logger.info(f"Daily recap posted to channel {RECAP_CHANNEL_ID}")
+
+    except Exception as e:
+        logger.error(f"Failed to post daily recap: {e}")
+
+
+# ── Slash command: /pipeline-recap (manual trigger) ──────────────────────────
+
+@app.command("/pipeline-recap")
+def handle_pipeline_recap(ack, body, client):
+    """Manually trigger a pipeline recap and post it to the user."""
+    ack()
+    user_id = body["user_id"]
+
+    client.chat_postMessage(channel=user_id, text="📊 Generating pipeline recap... one sec.")
+
+    try:
+        message = build_pipeline_recap()
+        client.chat_postMessage(channel=user_id, text=message)
+    except Exception as e:
+        logger.error(f"Pipeline recap error: {e}")
+        client.chat_postMessage(channel=user_id, text=f"❌ Failed to generate recap:\n```{str(e)}```")
+
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Start the daily recap scheduler
+    if RECAP_CHANNEL_ID:
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(
+            post_daily_recap,
+            trigger=CronTrigger(
+                hour=RECAP_HOUR,
+                minute=RECAP_MINUTE,
+                timezone="America/New_York",
+            ),
+            id="daily_recap",
+            name="Daily Pipeline Recap",
+        )
+        scheduler.start()
+        print(f"📅 Daily recap scheduled for {RECAP_HOUR}:{RECAP_MINUTE:02d} AM ET → channel {RECAP_CHANNEL_ID}")
+    else:
+        print("⚠️  RECAP_CHANNEL_ID not set — daily recap is disabled. Set it in Railway to enable.")
+
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     print("⚡ Sapien Sales Bot is running!")
     handler.start()
