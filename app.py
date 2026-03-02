@@ -79,7 +79,7 @@ def create_or_find_contact(email: str, first_name: str, last_name: str) -> str:
     return contact_id
 
 
-def create_or_find_company(company_name: str) -> str:
+def create_or_find_company(company_name: str, company_url: str = "") -> str:
     """Create a company in HubSpot. If the name already exists, return the existing ID."""
     search_url = f"{HUBSPOT_BASE}/crm/v3/objects/companies/search"
     search_body = {
@@ -98,10 +98,20 @@ def create_or_find_company(company_name: str) -> str:
     if results:
         company_id = results[0]["id"]
         logger.info(f"Found existing company {company_id} for {company_name}")
+        # Update the domain if a URL was provided and company already exists
+        if company_url:
+            domain = company_url.replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
+            update_url = f"{HUBSPOT_BASE}/crm/v3/objects/companies/{company_id}"
+            requests.patch(update_url, json={"properties": {"domain": domain, "website": company_url}}, headers=hubspot_headers())
         return company_id
 
     url = f"{HUBSPOT_BASE}/crm/v3/objects/companies"
-    body = {"properties": {"name": company_name}}
+    properties = {"name": company_name}
+    if company_url:
+        domain = company_url.replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
+        properties["domain"] = domain
+        properties["website"] = company_url
+    body = {"properties": properties}
     resp = requests.post(url, json=body, headers=hubspot_headers())
     resp.raise_for_status()
     company_id = resp.json()["id"]
@@ -191,6 +201,17 @@ def open_demo_form(ack, body, client):
                         "placeholder": {"type": "plain_text", "text": "e.g. jane@acme.com"},
                     },
                 },
+                {
+                    "type": "input",
+                    "block_id": "company_url_block",
+                    "label": {"type": "plain_text", "text": "Company Website URL"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "company_url",
+                        "placeholder": {"type": "plain_text", "text": "e.g. https://www.acme.com"},
+                    },
+                    "optional": True,
+                },
             ],
         },
     )
@@ -205,6 +226,7 @@ def handle_submission(ack, body, client, view):
     full_name = values["contact_name_block"]["contact_name"]["value"].strip()
     company_name = values["company_block"]["company_name"]["value"].strip()
     email = values["email_block"]["email"]["value"].strip()
+    company_url = (values["company_url_block"]["company_url"]["value"] or "").strip()
 
     # Parse first/last name
     name_parts = full_name.split(" ", 1)
@@ -226,7 +248,7 @@ def handle_submission(ack, body, client, view):
         contact_id = create_or_find_contact(email, first_name, last_name)
 
         # 2. Create or find company
-        company_id = create_or_find_company(company_name)
+        company_id = create_or_find_company(company_name, company_url)
 
         # 3. Associate contact ↔ company
         associate_contact_to_company(contact_id, company_id)
