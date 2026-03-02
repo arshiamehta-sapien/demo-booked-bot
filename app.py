@@ -139,7 +139,7 @@ def create_deal(deal_name: str, contact_id: str, company_id: str) -> str:
 def associate_contact_to_company(contact_id: str, company_id: str):
     """Associate a contact with a company in HubSpot."""
     url = (
-        f"{HUBSPOT_BASE}/crm/v3/objects/contacts/{contact_id}"
+        f"{HUBSPOT_BASE}/crm/v4/objects/contacts/{contact_id}"
         f"/associations/companies/{company_id}"
     )
     body = [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 1}]
