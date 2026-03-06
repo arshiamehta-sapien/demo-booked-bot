@@ -409,8 +409,25 @@ def handle_demo_submission(ack, body, client, view):
 
     # ── Step 2: Find HubSpot owner ──
     owner_id = ""
+    debug_lines = []
     if slack_email:
         owner_id = find_hubspot_owner_id(slack_email, slack_real_name)
+        debug_lines.append(f"Slack email: `{slack_email}`")
+        debug_lines.append(f"Slack name: `{slack_real_name}`")
+        debug_lines.append(f"Resolved owner_id: `{owner_id}`")
+        if not owner_id:
+            # Send debug info as a DM so we can see what's happening
+            try:
+                debug_msg = (
+                    f"🔧 *Owner Lookup Debug*\n"
+                    f"Slack email: `{slack_email}`\n"
+                    f"Slack name: `{slack_real_name}`\n"
+                    f"Owner ID found: `{owner_id or 'NONE'}`\n\n"
+                    f"_Check Railway logs for [S1]-[S4] details_"
+                )
+                client.chat_postMessage(channel=user_id, text=debug_msg)
+            except Exception:
+                pass
 
     try:
         # ── Step 3: Create contact, company, deal ──
