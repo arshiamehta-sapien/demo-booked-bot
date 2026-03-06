@@ -43,7 +43,6 @@ HUBSPOT_BASE = "https://api.hubapi.com"
 HUBSPOT_ACCOUNT_ID = "46061347"
 
 # ── Pipeline & Stages (Sales Pipeline New) ───────────────────────────────────
-# To update: change the IDs below to match your HubSpot pipeline.
 HUBSPOT_PIPELINE_ID = "876727395"
 
 STAGES = {
@@ -163,22 +162,40 @@ def create_or_find_company(company_name: str, company_url: str = "") -> str:
     return company_id
 
 
+# ── FIXED: Reliable owner lookup by email ────────────────────────────────────
 def find_hubspot_owner_by_email(email: str) -> str:
-    """Look up a HubSpot owner ID by their email address."""
+    """Look up a HubSpot owner ID by their email address.
+
+    Fetches ALL owners (with pagination) and does a case-insensitive
+    email comparison. The previous version relied on the /crm/v3/owners
+    `email` query-param filter which silently returns empty results
+    in many HubSpot accounts.
+    """
     url = f"{HUBSPOT_BASE}/crm/v3/owners"
-    resp = requests.get(url, headers=hubspot_headers(), params={"limit": 100, "email": email})
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    if results:
-        owner_id = results[0]["id"]
-        logger.info(f"Found HubSpot owner {owner_id} for {email}")
-        return owner_id
-    resp = requests.get(url, headers=hubspot_headers(), params={"limit": 100})
-    resp.raise_for_status()
-    for owner in resp.json().get("results", []):
-        if owner.get("email", "").lower() == email.lower():
-            logger.info(f"Found HubSpot owner {owner['id']} for {email}")
-            return owner["id"]
+    after = None
+
+    while True:
+        params = {"limit": 100}
+        if after:
+            params["after"] = after
+
+        resp = requests.get(url, headers=hubspot_headers(), params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for owner in data.get("results", []):
+            if owner.get("email", "").lower() == email.lower():
+                owner_id = owner["id"]
+                logger.info(f"Found HubSpot owner {owner_id} for {email}")
+                return owner_id
+
+        # Check for pagination
+        paging = data.get("paging", {})
+        next_page = paging.get("next", {})
+        after = next_page.get("after")
+        if not after:
+            break
+
     logger.warning(f"No HubSpot owner found for {email}")
     return ""
 
@@ -248,7 +265,6 @@ def search_deals_by_name(query: str, all_pipelines: bool = False) -> list:
     resp = requests.post(url, json=body, headers=hubspot_headers())
     resp.raise_for_status()
     results = resp.json().get("results", [])
-    # Build reverse stage map for display
     stage_id_to_name = {v: k for k, v in STAGES.items()}
     deals = []
     for r in results:
@@ -368,12 +384,17 @@ def handle_demo_submission(ack, body, client, view):
     user_id = body["user"]["id"]
     deal_name = company_name
 
+    # ── Auto-assign deal owner based on who ran the slash command ──
     owner_id = ""
     try:
         slack_user_info = client.users_info(user=user_id)
         slack_email = slack_user_info["user"]["profile"].get("email", "")
+        logger.info(f"Slack user {user_id} email: '{slack_email}'")  # Debug logging
         if slack_email:
             owner_id = find_hubspot_owner_by_email(slack_email)
+            logger.info(f"Resolved HubSpot owner_id: '{owner_id}' for Slack email '{slack_email}'")
+        else:
+            logger.warning(f"No email found in Slack profile for user {user_id}")
     except Exception as e:
         logger.warning(f"Could not look up Slack user email: {e}")
 
@@ -395,6 +416,8 @@ def handle_demo_submission(ack, body, client, view):
             f"• *Company:* {company_name}\n"
             f"• *Stage:* Demo Booked\n"
         )
+        if owner_id:
+            msg += f"• *Owner:* Assigned to you\n"
         if amount:
             msg += f"• *Amount:* ${amount}\n"
         if close_date:
@@ -457,7 +480,6 @@ def handle_deal_search(ack, body, client, view):
         )
         return
 
-    # Build deal options for the dropdown
     deal_options = [
         {
             "text": {"type": "plain_text", "text": f"{d['name']} ({d['stage']})"[:75]},
@@ -466,7 +488,6 @@ def handle_deal_search(ack, body, client, view):
         for d in deals
     ]
 
-    # Build stage options
     stage_options = [
         {"text": {"type": "plain_text", "text": name}, "value": stage_id}
         for name, stage_id in STAGES.items()
@@ -636,7 +657,6 @@ def handle_log_note(ack, body, client, view):
     user_id = body["user"]["id"]
 
     try:
-        # Create the note (engagement)
         url = f"{HUBSPOT_BASE}/crm/v3/objects/notes"
         note_body = {
             "properties": {
@@ -865,7 +885,6 @@ def handle_lost(ack, body, client, view):
     user_id = body["user"]["id"]
 
     try:
-        # Update the deal stage to Closed Lost
         url = f"{HUBSPOT_BASE}/crm/v3/objects/deals/{deal_id}"
         resp = requests.patch(
             url,
@@ -877,7 +896,6 @@ def handle_lost(ack, body, client, view):
         )
         resp.raise_for_status()
 
-        # Also log the reason as a note so it's visible in the timeline
         note_url = f"{HUBSPOT_BASE}/crm/v3/objects/notes"
         note_body = {
             "properties": {
@@ -940,7 +958,6 @@ def get_deal_notes(deal_id: str) -> list:
         "limit": 10,
     }
     resp = requests.post(url, json=body, headers=hubspot_headers())
-    # If search by association doesn't work, try fetching via associations API
     if resp.status_code != 200:
         return get_deal_notes_via_associations(deal_id)
     results = resp.json().get("results", [])
@@ -949,7 +966,6 @@ def get_deal_notes(deal_id: str) -> list:
 
 def get_deal_notes_via_associations(deal_id: str) -> list:
     """Fallback: get notes via the associations API then fetch each note."""
-    # Get associated note IDs
     url = f"{HUBSPOT_BASE}/crm/v4/objects/deals/{deal_id}/associations/notes"
     resp = requests.get(url, headers=hubspot_headers())
     if resp.status_code != 200:
@@ -957,7 +973,6 @@ def get_deal_notes_via_associations(deal_id: str) -> list:
     note_ids = [r["toObjectId"] for r in resp.json().get("results", [])][:10]
     if not note_ids:
         return []
-    # Fetch each note
     notes = []
     for nid in note_ids:
         nurl = f"{HUBSPOT_BASE}/crm/v3/objects/notes/{nid}"
@@ -1040,7 +1055,6 @@ Last Activity: {last_activity if last_activity else 'Never'}
     if notes:
         context += "RECENT NOTES:\n"
         for i, note in enumerate(notes[:5], 1):
-            # Strip HTML tags from notes
             clean = note.replace("<p>", "").replace("</p>", "\n").replace("<br>", "\n")
             clean = __import__('re').sub(r'<[^>]+>', '', clean)
             context += f"{i}. {clean[:500]}\n\n"
@@ -1152,20 +1166,16 @@ def handle_tldr(ack, body, client, view):
 
     user_id = body["user"]["id"]
 
-    # Send a "working on it" message first since this takes a few seconds
     client.chat_postMessage(channel=user_id, text=f"🔍 Pulling data for *{deal_label}*... one sec.")
 
     try:
-        # Gather all deal data
         deal_info = get_deal_details(deal_id)
         notes = get_deal_notes(deal_id)
         emails = get_deal_emails(deal_id)
         meetings = get_deal_meetings(deal_id)
 
-        # Generate AI summary
         summary = generate_tldr(deal_info, notes, emails, meetings)
 
-        # Get stage name for display
         stage_id_to_name = {v: k for k, v in STAGES.items()}
         props = deal_info.get("properties", {})
         stage_name = stage_id_to_name.get(props.get("dealstage", ""), "Unknown")
@@ -1256,7 +1266,6 @@ def build_pipeline_recap():
     if not deals:
         return "📊 *Daily Pipeline Recap*\n\nNo deals found in Sales Pipeline New."
 
-    # ── Group deals by stage ──
     by_stage = {}
     for deal in deals:
         props = deal.get("properties", {})
@@ -1266,7 +1275,6 @@ def build_pipeline_recap():
             by_stage[stage_name] = []
         by_stage[stage_name].append(props)
 
-    # ── Calculate metrics ──
     total_deals = len(deals)
     total_value = 0
     for deal in deals:
@@ -1277,9 +1285,8 @@ def build_pipeline_recap():
             except (ValueError, TypeError):
                 pass
 
-    # Deals closing this week
     today = datetime.utcnow().date()
-    end_of_week = today + timedelta(days=(6 - today.weekday()))  # Sunday
+    end_of_week = today + timedelta(days=(6 - today.weekday()))
     closing_this_week = []
     for deal in deals:
         props = deal.get("properties", {})
@@ -1292,14 +1299,12 @@ def build_pipeline_recap():
             except (ValueError, TypeError):
                 pass
 
-    # Deals with no activity in 7+ days
     stale_deals = []
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
     for deal in deals:
         props = deal.get("properties", {})
         stage_id = props.get("dealstage", "")
         stage_name = stage_id_to_name.get(stage_id, "")
-        # Skip terminal stages
         if stage_name in ("Closed Won", "Closed Lost", "Parked"):
             continue
         last_mod = props.get("hs_lastmodifieddate", "")
@@ -1311,7 +1316,6 @@ def build_pipeline_recap():
             except (ValueError, TypeError):
                 pass
 
-    # New deals (created in last 24h)
     yesterday = datetime.utcnow() - timedelta(hours=24)
     new_deals = []
     for deal in deals:
@@ -1325,15 +1329,12 @@ def build_pipeline_recap():
             except (ValueError, TypeError):
                 pass
 
-    # ── Build message ──
     msg = f"📊 *Daily Pipeline Recap — {today.strftime('%A, %B %d')}*\n\n"
 
-    # Top-line stats
     msg += f"*{total_deals}* deals in pipeline  •  "
     msg += f"*${total_value:,.0f}* total value  •  "
     msg += f"*{len(closing_this_week)}* closing this week\n\n"
 
-    # Deals per stage (in pipeline order)
     msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += "*Deals by Stage*\n"
     for stage_name in STAGES:
@@ -1353,7 +1354,6 @@ def build_pipeline_recap():
         msg += f"  {stage_name}: *{count}* deal{'s' if count != 1 else ''}  (${stage_value:,.0f})  {bar}\n"
     msg += "\n"
 
-    # Closing this week
     if closing_this_week:
         msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += "📅 *Closing This Week*\n"
@@ -1365,7 +1365,6 @@ def build_pipeline_recap():
             msg += f"  • {name}{amt_str} (close: {close})\n"
         msg += "\n"
 
-    # New deals (last 24h)
     if new_deals:
         msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += "🆕 *New Deals (Last 24h)*\n"
@@ -1376,11 +1375,10 @@ def build_pipeline_recap():
             msg += f"  • {name}{amt_str}\n"
         msg += "\n"
 
-    # Stale deals (no activity in 7+ days)
     if stale_deals:
         msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += "⚠️ *Needs Attention (No activity in 7+ days)*\n"
-        for d in stale_deals[:10]:  # Cap at 10 to keep message readable
+        for d in stale_deals[:10]:
             name = d.get("dealname", "Unknown")
             stage_id = d.get("dealstage", "")
             stage = stage_id_to_name.get(stage_id, "Unknown")
@@ -1413,8 +1411,6 @@ def post_daily_recap():
         logger.error(f"Failed to post daily recap: {e}")
 
 
-# ── Slash command: /pipeline-recap (manual trigger) ──────────────────────────
-
 @app.command("/pipeline-recap")
 def handle_pipeline_recap(ack, body, client):
     """Manually trigger a pipeline recap and post it to the user."""
@@ -1434,7 +1430,6 @@ def handle_pipeline_recap(ack, body, client):
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Start the daily recap scheduler
     if RECAP_CHANNEL_ID:
         scheduler = BackgroundScheduler()
         scheduler.add_job(
