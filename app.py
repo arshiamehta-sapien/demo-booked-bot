@@ -162,57 +162,80 @@ def create_or_find_company(company_name: str, company_url: str = "") -> str:
     return company_id
 
 
-# ── FIXED: Reliable owner lookup by email ────────────────────────────────────
-def find_hubspot_owner_by_email(email: str) -> str:
-    """Look up a HubSpot owner ID by their email address.
+# ── Owner lookup: multi-strategy approach ─────────────────────────────────────
+def find_hubspot_owner_by_email(email: str, slack_real_name: str = "") -> str:
+    """Look up a HubSpot owner ID using multiple strategies.
 
-    Tries multiple approaches:
-    1. Fetch all owners and check both 'email' and 'userId' fields
-    2. Fall back to a Slack-email-domain match against owner names
-       (as a last resort)
+    Strategy 1: Direct email filter on the owners endpoint
+    Strategy 2: Fetch all owners, match by email
+    Strategy 3: Fetch all owners, match by name (fallback using Slack display name)
 
-    The HubSpot /crm/v3/owners endpoint sometimes omits the email
-    field depending on the private app's scopes. This version logs
-    every owner it sees so you can debug in Railway logs.
+    This covers cases where:
+    - The email filter param works (most accounts)
+    - The email filter silently returns nothing
+    - Slack email doesn't match HubSpot email (e.g. different formats)
     """
-    url = f"{HUBSPOT_BASE}/crm/v3/owners"
-    all_owners = []
-    after = None
 
-    while True:
-        params = {"limit": 100}
-        if after:
-            params["after"] = after
-
-        resp = requests.get(url, headers=hubspot_headers(), params=params)
+    # ── Strategy 1: Direct email filter ──
+    try:
+        url = f"{HUBSPOT_BASE}/crm/v3/owners"
+        resp = requests.get(url, headers=hubspot_headers(), params={"email": email, "limit": 1})
         resp.raise_for_status()
-        data = resp.json()
-
-        for owner in data.get("results", []):
-            all_owners.append(owner)
-
-        paging = data.get("paging", {})
-        next_page = paging.get("next", {})
-        after = next_page.get("after")
-        if not after:
-            break
-
-    # Log all owners for debugging
-    logger.info(f"Found {len(all_owners)} HubSpot owners. Looking for email: {email}")
-    for owner in all_owners:
-        owner_email = owner.get("email", "")
-        owner_id = owner.get("id", "")
-        owner_name = f"{owner.get('firstName', '')} {owner.get('lastName', '')}".strip()
-        logger.info(f"  Owner {owner_id}: email='{owner_email}', name='{owner_name}'")
-
-        if owner_email and owner_email.lower() == email.lower():
-            logger.info(f"✅ Matched HubSpot owner {owner_id} by email for {email}")
+        results = resp.json().get("results", [])
+        if results:
+            owner_id = results[0]["id"]
+            logger.info(f"✅ [Strategy 1] Found owner {owner_id} via email filter for {email}")
             return owner_id
+        else:
+            logger.info(f"[Strategy 1] Email filter returned no results for {email}")
+    except Exception as e:
+        logger.warning(f"[Strategy 1] Failed: {e}")
 
-    # If no email match found, log warning and return empty
-    logger.warning(f"❌ No HubSpot owner matched email '{email}'. "
-                   f"This usually means the owners API is not returning email fields. "
-                   f"Check that your HubSpot private app has the 'crm.objects.owners.read' scope.")
+    # ── Strategy 2: Fetch all owners, match by email ──
+    all_owners = []
+    try:
+        url = f"{HUBSPOT_BASE}/crm/v3/owners"
+        after = None
+        while True:
+            params = {"limit": 100}
+            if after:
+                params["after"] = after
+            resp = requests.get(url, headers=hubspot_headers(), params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            all_owners.extend(data.get("results", []))
+            paging = data.get("paging", {})
+            after = paging.get("next", {}).get("after")
+            if not after:
+                break
+
+        logger.info(f"[Strategy 2] Fetched {len(all_owners)} owners, checking emails...")
+        for owner in all_owners:
+            owner_email = owner.get("email", "")
+            owner_id = owner.get("id", "")
+            owner_name = f"{owner.get('firstName', '')} {owner.get('lastName', '')}".strip()
+            logger.info(f"  Owner {owner_id}: email='{owner_email}', name='{owner_name}'")
+            if owner_email and owner_email.lower() == email.lower():
+                logger.info(f"✅ [Strategy 2] Matched owner {owner_id} by email for {email}")
+                return owner_id
+
+        logger.info(f"[Strategy 2] No email match found for {email}")
+    except Exception as e:
+        logger.warning(f"[Strategy 2] Failed: {e}")
+
+    # ── Strategy 3: Match by Slack display name → HubSpot owner name ──
+    if slack_real_name and all_owners:
+        slack_name_lower = slack_real_name.lower().strip()
+        logger.info(f"[Strategy 3] Trying name match: Slack name='{slack_real_name}'")
+        for owner in all_owners:
+            owner_name = f"{owner.get('firstName', '')} {owner.get('lastName', '')}".strip()
+            if owner_name and owner_name.lower() == slack_name_lower:
+                owner_id = owner["id"]
+                logger.info(f"✅ [Strategy 3] Matched owner {owner_id} by name '{owner_name}'")
+                return owner_id
+        logger.info(f"[Strategy 3] No name match found for '{slack_real_name}'")
+
+    logger.warning(f"❌ All strategies failed for email='{email}', name='{slack_real_name}'")
     return ""
 
 
@@ -404,15 +427,17 @@ def handle_demo_submission(ack, body, client, view):
     owner_id = ""
     try:
         slack_user_info = client.users_info(user=user_id)
-        slack_email = slack_user_info["user"]["profile"].get("email", "")
-        logger.info(f"Slack user {user_id} email: '{slack_email}'")  # Debug logging
+        slack_profile = slack_user_info["user"]["profile"]
+        slack_email = slack_profile.get("email", "")
+        slack_real_name = slack_user_info["user"].get("real_name", "") or slack_profile.get("real_name", "")
+        logger.info(f"Slack user {user_id}: email='{slack_email}', real_name='{slack_real_name}'")
         if slack_email:
-            owner_id = find_hubspot_owner_by_email(slack_email)
-            logger.info(f"Resolved HubSpot owner_id: '{owner_id}' for Slack email '{slack_email}'")
+            owner_id = find_hubspot_owner_by_email(slack_email, slack_real_name)
+            logger.info(f"Resolved HubSpot owner_id: '{owner_id}' for Slack user '{slack_real_name}' ({slack_email})")
         else:
             logger.warning(f"No email found in Slack profile for user {user_id}")
     except Exception as e:
-        logger.warning(f"Could not look up Slack user email: {e}")
+        logger.error(f"Could not look up Slack user email: {e}", exc_info=True)
 
     try:
         contact_id = create_or_find_contact(email, first_name, last_name)
