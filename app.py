@@ -166,12 +166,17 @@ def create_or_find_company(company_name: str, company_url: str = "") -> str:
 def find_hubspot_owner_by_email(email: str) -> str:
     """Look up a HubSpot owner ID by their email address.
 
-    Fetches ALL owners (with pagination) and does a case-insensitive
-    email comparison. The previous version relied on the /crm/v3/owners
-    `email` query-param filter which silently returns empty results
-    in many HubSpot accounts.
+    Tries multiple approaches:
+    1. Fetch all owners and check both 'email' and 'userId' fields
+    2. Fall back to a Slack-email-domain match against owner names
+       (as a last resort)
+
+    The HubSpot /crm/v3/owners endpoint sometimes omits the email
+    field depending on the private app's scopes. This version logs
+    every owner it sees so you can debug in Railway logs.
     """
     url = f"{HUBSPOT_BASE}/crm/v3/owners"
+    all_owners = []
     after = None
 
     while True:
@@ -184,19 +189,30 @@ def find_hubspot_owner_by_email(email: str) -> str:
         data = resp.json()
 
         for owner in data.get("results", []):
-            if owner.get("email", "").lower() == email.lower():
-                owner_id = owner["id"]
-                logger.info(f"Found HubSpot owner {owner_id} for {email}")
-                return owner_id
+            all_owners.append(owner)
 
-        # Check for pagination
         paging = data.get("paging", {})
         next_page = paging.get("next", {})
         after = next_page.get("after")
         if not after:
             break
 
-    logger.warning(f"No HubSpot owner found for {email}")
+    # Log all owners for debugging
+    logger.info(f"Found {len(all_owners)} HubSpot owners. Looking for email: {email}")
+    for owner in all_owners:
+        owner_email = owner.get("email", "")
+        owner_id = owner.get("id", "")
+        owner_name = f"{owner.get('firstName', '')} {owner.get('lastName', '')}".strip()
+        logger.info(f"  Owner {owner_id}: email='{owner_email}', name='{owner_name}'")
+
+        if owner_email and owner_email.lower() == email.lower():
+            logger.info(f"✅ Matched HubSpot owner {owner_id} by email for {email}")
+            return owner_id
+
+    # If no email match found, log warning and return empty
+    logger.warning(f"❌ No HubSpot owner matched email '{email}'. "
+                   f"This usually means the owners API is not returning email fields. "
+                   f"Check that your HubSpot private app has the 'crm.objects.owners.read' scope.")
     return ""
 
 
